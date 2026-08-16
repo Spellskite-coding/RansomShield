@@ -1,0 +1,19 @@
+{
+  "watch_dirs": ["/data"],
+  "honeypots": ["/data/.honeypot/DO_NOT_TOUCH.docx", "/data/.honeypot/backup_2024.zip"],
+  "mode": "enforce",
+  "entropy_threshold": 7.5,
+  "burst_file_count": 8,
+  "burst_window_secs": 10,
+  "sample_bytes": 8192,
+  "quarantine_dir": "/var/lib/ransomshield/quarantine",
+  "require_directory_baseline": true,
+  "incident_reports_dir": "/var/lib/ransomshield/incidents",
+  "notify_command": "/opt/notify_hook.sh",
+  "trusted_executables": [
+    {
+      "path": "/usr/local/bin/legit-encrypt-sim",
+      "sha256": "1babd7c081d6165336c08e2b45eae12ac70efb92b94436f154dd13e069224ed5"
+    }
+  ]
+}

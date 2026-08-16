@@ -1,0 +1,28 @@
+FROM debian:stable-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus procps bash coreutils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN systemctl mask systemd-udevd.service systemd-udevd-kernel.socket \
+        systemd-udevd-control.socket getty.target getty-static.service \
+        systemd-remount-fs.service sys-kernel-config.mount || true
+
+COPY target/x86_64-unknown-linux-musl/release/ransomshield /usr/local/bin/ransomshield
+COPY target/x86_64-unknown-linux-musl/release/attack_sim /usr/local/bin/attack-sim
+COPY target/x86_64-unknown-linux-musl/release/legit_backup_sim /usr/local/bin/legit-backup-sim
+COPY target/x86_64-unknown-linux-musl/release/legit_encrypt_sim /usr/local/bin/legit-encrypt-sim
+COPY systemd/ransomshield.service /etc/systemd/system/ransomshield.service
+COPY docker/config.json /etc/ransomshield/config.json
+COPY docker/benign_activity.sh /opt/benign_activity.sh
+COPY docker/notify_hook.sh /opt/notify_hook.sh
+RUN chmod +x /usr/local/bin/ransomshield /usr/local/bin/attack-sim /usr/local/bin/legit-backup-sim /usr/local/bin/legit-encrypt-sim /opt/benign_activity.sh /opt/notify_hook.sh \
+    && mkdir -p /data/.honeypot \
+    && systemctl enable ransomshield.service
+
+STOPSIGNAL SIGRTMIN+3
+VOLUME ["/sys/fs/cgroup"]
+CMD ["/sbin/init"]

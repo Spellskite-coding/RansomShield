@@ -1,0 +1,22 @@
+[Unit]
+Description=RansomShield behavior-based ransomware detection daemon
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/ransomshield --config /etc/ransomshield/config.json
+Restart=on-failure
+RestartSec=2
+NotifyAccess=main
+
+# The daemon needs CAP_SYS_ADMIN for fanotify (filesystem-wide marks) and
+# CAP_KILL to neutralize offending processes in Enforce mode. Everything
+# else is dropped.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/ransomshield
+
+[Install]
+WantedBy=multi-user.target
