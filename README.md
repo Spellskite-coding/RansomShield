@@ -103,16 +103,59 @@ JSON file, default path `/etc/ransomshield/config.json`:
 
 ## Deployment
 
+### Automated (recommended)
+
+Clone the repo on the server you want to protect and run the installer as root. It builds the
+daemon, installs the binary/config/systemd unit, starts the service, and verifies it actually
+came up - printing a clear pass/fail summary either way.
+
+```sh
+git clone <this-repo>
+cd ransomshield
+sudo ./install.sh /data /home        # directories to watch; defaults to /home if omitted
+```
+
+Starts in `monitor` mode by default (logs and writes incident reports, never kills/quarantines) -
+pass `--enforce` instead once you've reviewed monitor-mode reports against real traffic and are
+confident in the thresholds. Safe to re-run to rebuild/upgrade: it never overwrites an existing
+`/etc/ransomshield/config.json`, so thresholds you've already tuned are preserved.
+
+### Manual
+
 ```sh
 sudo cp target/release/ransomshield /usr/local/bin/
 sudo cp systemd/ransomshield.service /etc/systemd/system/
 sudo mkdir -p /etc/ransomshield && sudo cp your-config.json /etc/ransomshield/config.json
+sudo mkdir -p /var/lib/ransomshield/quarantine /var/lib/ransomshield/incidents
 sudo systemctl daemon-reload
 sudo systemctl enable --now ransomshield
 ```
 
 The unit requests only `CAP_SYS_ADMIN` (for `fanotify`) and `CAP_KILL` (to neutralize
-processes) - not full root capabilities - and sets `NoNewPrivileges`/`ProtectSystem=strict`.
+processes) - not full root capabilities - and sets `NoNewPrivileges`/`ProtectSystem=strict`,
+which makes the whole filesystem read-only except `/etc/ransomshield`. **If you deploy by hand
+instead of via `install.sh`**, you also need to grant write access to your quarantine dir,
+incident reports dir, and every `watch_dir` (honeypot files are created there) - e.g. via a
+`/etc/systemd/system/ransomshield.service.d/local.conf` drop-in:
+
+```ini
+[Service]
+ReadWritePaths=/etc/ransomshield /var/lib/ransomshield/quarantine /var/lib/ransomshield/incidents /data /home
+```
+
+`install.sh` generates this drop-in automatically from whatever directories you pass it.
+
+### Uninstalling
+
+```sh
+sudo systemctl disable --now ransomshield
+sudo rm /etc/systemd/system/ransomshield.service
+sudo rm -rf /etc/systemd/system/ransomshield.service.d
+sudo systemctl daemon-reload
+sudo rm /usr/local/bin/ransomshield
+# /etc/ransomshield, /var/lib/ransomshield (config, quarantined files, incident reports) are
+# left in place intentionally - remove them yourself once you've confirmed you don't need them.
+```
 
 ## Testing
 
