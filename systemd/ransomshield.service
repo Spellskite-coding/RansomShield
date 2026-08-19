@@ -16,6 +16,15 @@ AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL
 NoNewPrivileges=true
 ProtectSystem=strict
+# Only the config directory is writable from the base unit. ProtectSystem=strict
+# makes the rest of the filesystem read-only, so the daemon also needs write
+# access to wherever quarantine_dir/incident_reports_dir point and to every
+# watch_dir (honeypot files are created there). install.sh computes those from
+# your actual config and adds them via a
+# /etc/systemd/system/ransomshield.service.d/ drop-in rather than editing this
+# file - if you install by hand instead, add your own ReadWritePaths= drop-in
+# (or extend this line) or the daemon will fail to quarantine files/provision
+# honeypots.
 ReadWritePaths=/etc/ransomshield
 
 [Install]
