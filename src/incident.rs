@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +25,12 @@ impl IncidentReporter {
     pub fn new(dir: &Path, notify_command: Option<String>) -> Result<Self> {
         fs::create_dir_all(dir)
             .with_context(|| format!("creating incident reports dir {}", dir.display()))?;
+        // Incident reports name affected files and PIDs; keep them root-only
+        // rather than relying on create_dir_all's umask-dependent default -
+        // see the identical reasoning in quarantine.rs.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("setting permissions on incident reports dir {}", dir.display())
+        })?;
         Ok(Self { dir: dir.to_path_buf(), notify_command })
     }
 
