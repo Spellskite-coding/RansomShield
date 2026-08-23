@@ -23,7 +23,11 @@ use crate::config::TrustedExecutable;
 /// no legitimate trusted tool has a reason to touch a honeypot file.
 pub struct TrustStore {
     trusted: Vec<TrustedExecutable>,
-    cache: HashMap<i32, (bool, Instant)>,
+    /// Keyed by pid; value is (trusted?, when checked, that process's boot-relative
+    /// start time). The start time is what makes a cache hit mean "the same
+    /// process I checked before", not just "some process currently wearing
+    /// this pid number" - see `process_starttime`.
+    cache: HashMap<i32, (bool, Instant, u64)>,
     cache_ttl: Duration,
 }
 
@@ -41,19 +45,46 @@ impl TrustStore {
         }
 
         let now = Instant::now();
-        if let Some((trusted, checked_at)) = self.cache.get(&pid) {
-            if now.duration_since(*checked_at) < self.cache_ttl {
+        let starttime = Self::process_starttime(pid);
+
+        if let (Some((trusted, checked_at, cached_start)), Some(start)) =
+            (self.cache.get(&pid), starttime)
+        {
+            if *cached_start == start && now.duration_since(*checked_at) < self.cache_ttl {
                 return *trusted;
             }
         }
 
         let result = self.compute_trust(pid);
-        self.cache.insert(pid, (result, now));
+        // Only cache when we could read a start time to bind the entry to -
+        // otherwise a subsequent lookup could never invalidate it correctly
+        // and we'd rather recompute than risk serving a stale verdict.
+        if let Some(start) = starttime {
+            self.cache.insert(pid, (result, now, start));
+        }
         // Bound cache growth on a long-running daemon watching a busy host
         // with lots of short-lived PIDs: drop anything stale well past its
         // TTL rather than accumulating forever.
-        self.cache.retain(|_, (_, checked_at)| now.duration_since(*checked_at) < self.cache_ttl * 4);
+        self.cache.retain(|_, (_, checked_at, _)| now.duration_since(*checked_at) < self.cache_ttl * 4);
         result
+    }
+
+    /// The process's start time (field 22 of `/proc/<pid>/stat`, in clock
+    /// ticks since boot) - unique to a given (pid, lifetime) pair on this
+    /// system. Used to make sure a cache hit refers to the exact same
+    /// process we last checked, not merely the same pid number: PIDs are
+    /// reused once the kernel's pid space wraps around, and without this
+    /// check a short-lived trusted process's cached "trusted" verdict could
+    /// otherwise be handed, for up to `cache_ttl`, to a completely different
+    /// and untrusted process that happened to reuse its pid.
+    ///
+    /// `comm` (the second field) is parsed defensively by searching for the
+    /// last `)` rather than splitting on whitespace, since it can itself
+    /// contain spaces or parentheses.
+    fn process_starttime(pid: i32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        after_comm.split_whitespace().nth(19)?.parse().ok()
     }
 
     fn compute_trust(&self, pid: i32) -> bool {
@@ -91,5 +122,56 @@ impl TrustStore {
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_starttime_is_stable_and_present_for_self() {
+        let pid = std::process::id() as i32;
+        let a = TrustStore::process_starttime(pid);
+        let b = TrustStore::process_starttime(pid);
+        assert!(a.is_some(), "expected a start time for our own running process");
+        assert_eq!(a, b, "start time must be stable across repeated reads");
+    }
+
+    #[test]
+    fn process_starttime_is_none_for_a_pid_that_does_not_exist() {
+        assert_eq!(TrustStore::process_starttime(999_999_999), None);
+    }
+
+    #[test]
+    fn a_cache_entry_with_a_mismatched_starttime_is_not_trusted_blindly() {
+        let exe = std::env::current_exe().unwrap();
+        let mut f = fs::File::open(&exe).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let sha256: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+
+        let pid = std::process::id() as i32;
+        let mut store = TrustStore::new(vec![TrustedExecutable { path: exe, sha256 }]);
+
+        // Poison the cache as if we'd previously (wrongly) decided this pid
+        // was untrusted, under a starttime that does not match its real,
+        // current one - simulating the pid having been reused by a
+        // different process since that entry was made.
+        let now = Instant::now();
+        store.cache.insert(pid, (false, now, 0));
+
+        // A real, unmodified copy of the trusted binary at the trusted path
+        // is running as this very test process, so the correct, freshly
+        // computed answer is `true` - the mismatched starttime must force
+        // that recheck rather than returning the poisoned cached `false`.
+        assert!(store.is_trusted(pid));
     }
 }
