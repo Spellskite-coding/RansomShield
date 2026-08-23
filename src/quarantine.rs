@@ -1,5 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,15 @@ impl Quarantine {
     pub fn new(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)
             .with_context(|| format!("creating quarantine dir {}", dir.display()))?;
+        // Quarantined content is exactly what a ransomware run just wrote,
+        // so it's ransomware payload output at rest; set 0700 explicitly
+        // rather than trusting create_dir_all's umask-dependent default
+        // (install.sh already does this too, but the daemon shouldn't
+        // depend on that - this dir can also be created directly by the
+        // daemon itself, e.g. a manual, non-install.sh deployment, or a
+        // fresh boot where the directory was deleted).
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting permissions on quarantine dir {}", dir.display()))?;
         Ok(Self { dir: dir.to_path_buf() })
     }
 
