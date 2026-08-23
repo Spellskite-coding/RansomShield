@@ -17,17 +17,24 @@ no kernel modules, no eBPF, no unsafe code in the daemon itself.
 
 1. **Filesystem monitoring** - `fanotify` with `FAN_MARK_FILESYSTEM` watches every file close
    on the mount(s) holding the configured `watch_dirs`. This needs `CAP_SYS_ADMIN`.
-2. **Entropy sampling** - when a file is closed after being written, RansomShield reads the
-   first few KB through the same file descriptor the kernel handed it in the event (not by
-   re-opening the path) and computes its Shannon entropy. Encrypted/compressed data sits near
+2. **Entropy sampling** - when a file is closed after being written, RansomShield samples it
+   (up to `sample_bytes` total, split across up to three points - start, middle, end - for
+   anything bigger than that budget) through the same file descriptor the kernel handed it in
+   the event (not by re-opening the path), and computes the Shannon entropy of each sampled
+   chunk independently, keeping the highest. Sampling more than just the head matters: some
+   ransomware deliberately leaves a file's beginning untouched and only encrypts from partway
+   through, specifically to dodge head-only entropy checks. Encrypted/compressed data sits near
    the theoretical maximum (~8 bits/byte); plain text and most documents sit well below it.
-3. **Directory baseline** - a high-entropy write only counts toward detection if its directory
-   has *previously* held ordinary (low-entropy) content - either observed live, or found during
-   a one-time startup scan of existing files. This is what tells apart "your documents folder
-   is suddenly full of ciphertext" (suspicious) from "your backup/export folder just received a
-   batch of new archives" (routine). Without it, any workload that legitimately produces batches
-   of new compressed files (backups, media exports, build artifacts) would trigger false
-   positives.
+3. **Directory baseline** - a high-entropy write only counts toward detection if its directory,
+   *or any ancestor of it*, has previously held ordinary (low-entropy) content - either observed
+   live, or found during a one-time startup scan of existing files. Checking the whole ancestor
+   chain (not just the exact directory) means a brand-new subdirectory created under an
+   already-active tree is covered from the moment it's created, not only once something plaintext
+   happens to be written into that exact subdirectory itself. This is what tells apart "your
+   documents folder is suddenly full of ciphertext" (suspicious) from "your backup/export folder
+   just received a batch of new archives" (routine). Without it, any workload that legitimately
+   produces batches of new compressed files (backups, media exports, build artifacts) would
+   trigger false positives.
 4. **Burst detection** - if the same process high-entropy-rewrites enough *distinct* files
    (`burst_file_count`, default 8) within a time window (`burst_window_secs`, default 10s) in a
    directory that has a plaintext baseline, it's treated as ransomware.
@@ -148,14 +155,16 @@ ReadWritePaths=/etc/ransomshield /var/lib/ransomshield/quarantine /var/lib/ranso
 ### Uninstalling
 
 ```sh
-sudo systemctl disable --now ransomshield
-sudo rm /etc/systemd/system/ransomshield.service
-sudo rm -rf /etc/systemd/system/ransomshield.service.d
-sudo systemctl daemon-reload
-sudo rm /usr/local/bin/ransomshield
-# /etc/ransomshield, /var/lib/ransomshield (config, quarantined files, incident reports) are
-# left in place intentionally - remove them yourself once you've confirmed you don't need them.
+sudo ./uninstall.sh            # stops/disables the service, removes the binary
+                                # and systemd unit; leaves your config,
+                                # quarantined files, and incident reports on disk
+sudo ./uninstall.sh --purge    # also deletes /etc/ransomshield and
+                                # /var/lib/ransomshield
 ```
+
+Safe to re-run. Config and data are kept by default specifically so a routine
+or accidental uninstall can never silently destroy quarantined evidence or
+incident history - pass `--purge` once you've confirmed you don't need them.
 
 ## Testing
 
@@ -178,7 +187,10 @@ host, and never with real malware - only simulated I/O *patterns*:
   own email/Slack/PagerDuty script.
 - `docker/Dockerfile.{ubuntu,debian,fedora,almalinux,rockylinux}` - systemd-enabled test images
   covering both major packaging families (deb/rpm) and both bleeding-edge (Fedora) and
-  conservative-enterprise (RockyLinux/AlmaLinux, RHEL-family) glibc/kernel baselines.
+  conservative-enterprise (RockyLinux/AlmaLinux, RHEL-family) glibc/kernel baselines. The
+  `trusted_executables` hash baked into `docker/config.json` is recomputed at image build time
+  against the binary actually in the image (rather than trusting a hash committed to the repo),
+  so the trust-allowlist test can't silently go stale across a toolchain/compiler change.
 
 ```sh
 cargo build --release
@@ -191,6 +203,13 @@ docker exec rs-test /usr/local/bin/legit-backup-sim /data/backups 15   # should 
 docker exec rs-test /usr/local/bin/attack-sim /data/victim 20         # should be stopped early
 docker logs rs-test
 ```
+
+### Unit tests
+
+`cargo test` (run inside the same build container as above - see "Building") covers the pure
+logic that's cheap to exercise without a real fanotify group: entropy scoring, the directory-
+baseline walk (including a brand-new subdirectory of an already-baselined tree), the burst
+detector's per-pid bookkeeping cleanup, and the trust cache's process-identity check.
 
 ## Effectiveness & limitations
 
@@ -222,6 +241,69 @@ Across 5 distros (Ubuntu, Debian, RockyLinux, AlmaLinux, Fedora) in repeated tes
   shutdown hang on SIGTERM, an unbounded fanotify-read retry loop, and a zombie-process leak from
   unreaped notify-command children.
 
+### Third review: adversarial (red-team) testing
+
+A further round of SAST plus live adversarial testing - custom attack tooling built from scratch
+and run only against this project's own simulators inside a disposable Docker container, never
+real malware - found and fixed four real gaps, and confirmed two more that are disclosed below
+as deliberate, unfixed tradeoffs rather than patched:
+
+Fixed:
+
+- **Intermittent/partial-encryption evasion.** Entropy used to be sampled only from a file's
+  first `sample_bytes`. A file left with its header untouched and only encrypted/corrupted from
+  some later offset onward - a real technique some ransomware uses specifically to dodge
+  head-only entropy detectors - sampled as ordinary plaintext and went completely undetected in
+  testing. Fixed by sampling up to three points (start, middle, end) and scoring each
+  independently, taking the highest reading - concatenating the sampled bytes into one buffer
+  first (an intermediate version of this fix) turned out to still be evadable, since blending a
+  plaintext chunk with a high-entropy one scores the entropy of the *mixture*, which can land
+  back under the threshold.
+- **Brand-new-subdirectory bypass of the directory-baseline gate.** The burst heuristic requires
+  a directory to have previously held plaintext before counting high-entropy writes in it - but
+  only checked a file's immediate parent directory. A subdirectory created fresh under an
+  already-baselined tree (e.g. a new folder inside a user's active home directory) inherited none
+  of that history and so was never protected at all: 20 high-entropy files written directly into
+  one went completely undetected in testing. Fixed by walking up the ancestor chain instead of
+  checking only the immediate parent.
+- **Unbounded memory growth (DoS) from ordinary process churn.** The burst tracker kept one
+  bookkeeping entry per distinct PID it had ever seen write a high-entropy file, and only ever
+  removed one after that PID triggered an actual detection - so any process that legitimately
+  writes a single high-entropy file and exits (which describes an enormous amount of normal
+  server activity: short-lived scripts, cron jobs, admin one-liners) leaked a small amount of
+  memory forever. 3,000 one-shot writers grew the daemon's RSS from ~1.9 MB to ~3.0 MB with no
+  way back down; on a busy, long-lived server this is a slow path to OOM (i.e. to the protection
+  itself going down). Fixed with an opportunistic sweep that drops any PID's bookkeeping once its
+  own window has elapsed - confirmed by re-running the same 3,000-process load, then observing
+  RSS drop back down once the sweep next runs.
+- **Trust-cache identity gap.** The trusted-executable cache kept its "trusted" verdict for a PID
+  for 60 seconds based on the PID number alone, with no check that it still refers to the same
+  process. That's a real gap in principle (a reused PID, or a trusted-but-scriptable tool that
+  changes what code it's running mid-life, could inherit unearned trust for the rest of the
+  window) - a live PID-recycling or code-injection proof-of-concept wasn't achievable in this
+  sandboxed test environment (writing to `/proc/sys/kernel/pid_max` was blocked read-only, and
+  installing a compiler for a custom PoC hit repeated network failures pulling apt packages), so
+  this one is a proactive fix from code-level reasoning rather than a confirmed live exploit.
+  Fixed by binding each cache entry to the process's boot-relative start time (from
+  `/proc/<pid>/stat`), so a cache hit means "the exact same process", not just "the same PID
+  number".
+- Quarantine and incident-report directories are now created with explicit `0700` permissions by
+  the daemon itself, rather than relying on `install.sh` (which already did this) or an
+  umask-dependent default from `create_dir_all` - defense in depth for a manual or non-`install.sh`
+  deployment.
+
+Confirmed, disclosed, **not** fixed (see caveats below for why):
+
+- **Distributed multi-process burst evasion.** Splitting the same amount of encryption across
+  several concurrent processes, each staying under `burst_file_count`, evades the burst heuristic
+  entirely - confirmed with 4 workers x 7 files each (28 files total, 0 detected) even though a
+  single process doing all 28 would have been stopped at file 8.
+- **Silent honeypot disarming.** Deleting a honeypot file produces no fanotify event under the
+  mask this daemon watches (`FAN_CLOSE_WRITE`/`FAN_MODIFY` - deletion is neither), so an attacker
+  who finds and removes a honeypot disarms that specific trap with no detection at all, confirmed
+  in testing. The daemon's other defenses (burst/entropy heuristic, any other honeypots) are
+  unaffected.
+
 Caveats, honestly:
 
 - This is heuristic, behavior-based detection - not a cryptographic guarantee. A patient
@@ -231,17 +313,27 @@ Caveats, honestly:
   well-resourced, patient attacker deliberately staying under the radar - not the common
   opportunistic ransomware case, which wants to encrypt as much as possible as fast as possible
   and is exactly what the burst heuristic is built to catch quickly.
+- Detection is scoped per originating PID, by design (this is what lets ordinary, unrelated
+  activity on a shared host coexist without one process's writes counting against another's
+  threshold) - the tradeoff is the confirmed distributed multi-process evasion described above.
+  Honeypots are unaffected by this and remain the independent backstop for that scenario.
+- Honeypots are a strong signal only for as long as they exist and are watched for writes -
+  deletion is silent, as described above. Plant more than one, in more than one location.
 - The trusted-executables allowlist is a scalpel, not a broad exemption: allowlist specific,
   narrow admin/backup scripts you actually control, not general-purpose system crypto tools -
   anything that can be invoked to bulk-process arbitrary files, if allowlisted, is a tool an
   attacker could in principle also invoke directly against victim files to bypass the burst
-  heuristic (though never honeypot detection).
+  heuristic (though never honeypot detection). This also means: don't allowlist anything that
+  itself has a plugin/hook/scripting surface (e.g. a shell, an interpreter) rather than being a
+  fixed, self-contained tool - the trust cache's 60-second window is checked against the trusted
+  process's identity (see "Trust-cache identity gap" above), not against what code it's actually
+  running at every instant.
 - Detection thresholds are defaults, not universal constants - tune `entropy_threshold`,
   `burst_file_count`, and `burst_window_secs` against your actual workload, ideally starting in
   `monitor` mode.
 - Testing here used simulated I/O *patterns*, never real ransomware samples - by design, per a
   strict no-real-malware testing policy. Real-world validation against actual ransomware
   families has not been performed.
-- It's a young project that has had two review passes, not a production track record. Treat it
+- It's a young project that has had three review passes, not a production track record. Treat it
   as a strong additional layer, not a sole line of defense - keep offline/immutable backups
   regardless.
