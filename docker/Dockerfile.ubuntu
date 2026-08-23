@@ -24,6 +24,15 @@ RUN chmod +x /usr/local/bin/ransomshield /usr/local/bin/attack-sim /usr/local/bi
     && mkdir -p /data/.honeypot \
     && systemctl enable ransomshield.service
 
+# The trusted_executables hash in docker/config.json is a snapshot from
+# whatever toolchain last produced it; it goes stale (and silently disables
+# the trust allowlist test) whenever the binary is rebuilt with a different
+# compiler/rustc version, since that changes the compiled bytes and thus the
+# hash. Recompute it against the binary actually baked into this image so
+# the trust test always reflects reality instead of a possibly-stale value.
+RUN real_hash="$(sha256sum /usr/local/bin/legit-encrypt-sim | cut -d' ' -f1)" \
+    && sed -i "s/\"sha256\": *\"[0-9a-f]*\"/\"sha256\": \"${real_hash}\"/" /etc/ransomshield/config.json
+
 STOPSIGNAL SIGRTMIN+3
 VOLUME ["/sys/fs/cgroup"]
 CMD ["/sbin/init"]
