@@ -209,7 +209,17 @@ docker logs rs-test
 `cargo test` (run inside the same build container as above - see "Building") covers the pure
 logic that's cheap to exercise without a real fanotify group: entropy scoring, the directory-
 baseline walk (including a brand-new subdirectory of an already-baselined tree), the burst
-detector's per-pid bookkeeping cleanup, and the trust cache's process-identity check.
+detector's per-pid bookkeeping cleanup, the trust cache's process-identity check and its path
+resolution, honeypot inode identity and re-arming, quarantine containment and name bounding,
+and rejection of fail-open configurations. 31 unit tests in total.
+
+On top of those, a 38-check behavioural suite runs the real daemon under `CAP_SYS_ADMIN` in a
+disposable Docker container and exercises each fixed finding end to end - attack detected and
+contained, scope filter holding, canary surviving and re-triggering, honeypot rename/hard-link
+evasions failing, deep-path quarantine succeeding, hostile filenames not forging reports, the
+allowlist exempting a trusted tool while still catching a spoofed one - plus the
+false-positive and monitor-mode regressions. No malware is involved at any point: the
+simulators only reproduce I/O patterns with random bytes.
 
 ## Effectiveness & limitations
 
@@ -304,6 +314,118 @@ Confirmed, disclosed, **not** fixed (see caveats below for why):
   in testing. The daemon's other defenses (burst/entropy heuristic, any other honeypots) are
   unaffected.
 
+### Fourth review: SAST focused on logic and business-logic flaws
+
+A further static pass, deliberately aimed at detection logic rather than memory safety, found seven
+confirmed bypasses (each reproduced against the project's real functions before being fixed) plus a
+set of robustness gaps. `cargo audit` is clean: no known vulnerabilities across 71 transitive
+dependencies. No `unsafe`, no `unwrap()` on attacker-controlled data.
+
+Fixed:
+
+- **Probe-alignment evasion of the three-point entropy sampler.** The previous round's fix sampled
+  start/middle/end, but those offsets are derived from public constants and the file's own size, so
+  an attacker can compute them exactly and leave plaintext in precisely those windows. Confirmed: a
+  1 MiB file with only the three 2,730-byte probe windows intact - 99.2% of it high-entropy -
+  measured **4.397 bits/byte** and passed straight under a 7.5 threshold. Fixed by choosing sampling
+  offsets at random per event (5 probes, same total bytes read). Re-tested: 200/200 evasions before,
+  0/200 after, with no false positives on ordinary text and no regression on genuine ciphertext or
+  intermittent encryption.
+- **Honeypot identity was a path string, not an inode.** A hard link, a `rename` before writing, or
+  `open()`+`unlink()`+`write()` (after which `/proc/self/fd` reports `<path> (deleted)`) each let an
+  attacker write to the very same canary inode while matching no configured path. Fixed by keying
+  honeypots on `(st_dev, st_ino)` from an `fstat` of the descriptor fanotify already provides -
+  which also removed a `readlink` and a `canonicalize` from the hot path.
+- **The daemon destroyed its own canary.** On a honeypot hit the canary's path went into the
+  affected-files list, and quarantine is a `rename` off the live filesystem - so the trap deleted
+  itself, and `provision()` only runs at startup. One throwaway process doing nothing but opening
+  and closing each canary disarmed every honeypot before the real payload ran. Fixed: the canary is
+  never quarantined, and is re-armed after the incident.
+- **The destructive response was not bounded to `watch_dirs`.** `FAN_MARK_FILESYSTEM` delivers
+  events for the whole mount, and no code ever compared an event path against `watch_dirs` - the
+  field only placed the mark and seeded the baseline. On a default install (`watch_dirs: ["/home"]`,
+  and /home is rarely its own mount) the daemon could kill a process and relocate its files anywhere
+  on `/`. That is both an attacker primitive and a large false-positive surface: `logrotate`
+  compressing `/var/log`, `git gc` writing packfiles, `restic`, `apt`. Fixed with a scope filter on
+  every event path plus a containment check on the canonicalized path inside `Quarantine::take()` -
+  which also closes a TOCTOU where a second, un-stopped process swaps a parent directory for a
+  symlink to `/etc` mid-response.
+- **The trusted-executables allowlist silently matched nothing on any usr-merged distro.**
+  `/proc/<pid>/exe` reports the *resolved* path of the running image, but operators write the path
+  they normally type - and on Debian 12+, Ubuntu 20.04+, Fedora, RHEL 8+ and Arch, `/bin` and
+  `/sbin` are symlinks into `/usr`. A config saying `/bin/gpg` therefore never matched the kernel's
+  `/usr/bin/gpg` under the plain string comparison, the allowlist did nothing at all, and in Enforce
+  mode the operator's legitimate backup or encryption tool got killed with no hint as to why. Found
+  by live testing, not by reading: the unit tests all passed. Fixed by canonicalizing configured
+  paths once at startup (and logging loudly when a configured path cannot be resolved at all, which
+  is the other way to get silent no-trust). The path is only a lookup key - the SHA-256 of the
+  running image is still what actually grants trust - so this does not weaken the anchor.
+- **Trust hashed the path, not the running image.** `compute_trust` resolved `/proc/<pid>/exe` to a
+  path and hashed *that path*, so an attacker who bind-mounts their binary over a trusted path
+  inside their own mount namespace gets the daemon to hash the real host binary and grant the
+  bypass. Fixed by hashing `/proc/<pid>/exe` as a descriptor, which always refers to the inode
+  genuinely being executed.
+- **SIGKILL could hit a recycled PID.** The trust cache carefully binds its verdicts to a process's
+  start time, but the kill path took a raw PID from a possibly-stale queued event with no such
+  check - as root, with `CAP_KILL`. Fixed by recording the start time at first observation and
+  re-verifying it immediately before signalling, plus an outright refusal to signal PID <= 1.
+- **A failed kill still reset the counter.** `forget(pid)` ran unconditionally, so a ransomware
+  process that survived SIGKILL got a fresh counter and had to re-accumulate `burst_file_count`
+  files before tripping again - forever, while it kept encrypting. Fixed: bookkeeping is only
+  cleared once the process is confirmed gone (`ESRCH` counts as gone).
+- **Baseline-scan starvation.** The startup scan scored *every* file it met, capped at 50,000, so
+  an attacker could flood one directory and starve the walk before it reached the real data -
+  leaving the burst heuristic disabled there after the next restart. Fixed by moving on as soon as a
+  directory yields one plaintext file, turning the cap into "50,000 directories" and shortening the
+  startup blind window considerably.
+- **Configuration was accepted unvalidated.** `sample_bytes: 0` made every entropy probe zero-length
+  (detection silently off), an `entropy_threshold` above 8.0 was unreachable (same effect), and
+  `burst_file_count: 0` made `files.len() >= 0` trivially true - SIGKILL on the first high-entropy
+  write from any process. All now rejected at load. The daemon also refuses a group/world-writable
+  config file.
+- **Honeypots were unreachable bait, and their locations were public.** Provisioned under root's
+  umask they were mode 0644 root-owned, so an unprivileged process got `EACCES` - and a *failed*
+  open produces no fanotify event, meaning the trap physically could not fire. Meanwhile
+  `install.sh` left `/etc/ransomshield/config.json` at 0644, publishing the honeypot locations,
+  thresholds and allowlist to every local user. Canaries are now provisioned 0666 inside a
+  root-owned 0755 directory (writable bait that cannot be unlinked or renamed, which also closes
+  the previously-disclosed silent-deletion evasion), and the config is 0600.
+- **Unresolvable paths collapsed into one burst slot.** A failed `readlink` substituted the literal
+  path `<unknown>`, so every such write by a pid counted as the same distinct file and could never
+  add up. Those events are now skipped outright.
+- **Quarantine could fail outright or overwrite evidence.** Names embedded the whole original path,
+  so a deep enough attacker-chosen path exceeded the 255-byte filename limit and made both the
+  rename and the copy fallback fail (leaving the encrypted file in place while the response reported
+  success); and `/` -> `_` is not injective, so `/data/x/y` and `/data/x_y` collided. Names are now
+  truncated with a hash of the full path appended.
+- **Attacker-controlled filenames flowed unescaped into incident reports** (forging a record an
+  incident responder reads) **and into the notify hook's environment**, where an unquoted expansion
+  in an operator script runs as root. Control characters are now stripped.
+- systemd hardening: `Restart=always` (the daemon exits 0 on SIGTERM, so `on-failure` let a single
+  `kill -TERM` switch protection off permanently), `MemoryMax=`, `RestrictNamespaces=`,
+  `ProtectKernelModules=`, `ProtectKernelTunables=`, `RestrictRealtime=`, `RestrictSUIDSGID=`,
+  `SystemCallArchitectures=native`, `LockPersonality=`. The plaintext-baseline set is also bounded
+  in code now (it grew without limit, the same leak class already fixed for `recent_writes`).
+
+Confirmed, disclosed, **not** fixed:
+
+- **Writes through `mmap(MAP_SHARED)` produce no event at all.** The watched mask is
+  `FAN_CLOSE_WRITE | FAN_MODIFY`; writeback of dirty pages from a shared mapping emits neither. The
+  sequence `open(O_RDWR)` -> `mmap` -> `close(fd)` -> encrypt in memory is silent, and the one event
+  it does emit (the close) fires *before* any modification, so the daemon samples an intact file and
+  strengthens the directory baseline. Closing this would require watching `mmap` or moving to
+  permission events (`FAN_CLASS_CONTENT`) - a new subsystem and a filesystem-wide deadlock risk.
+- **Encoding the ciphertext defeats entropy detection.** base64 or hex output is just as
+  unrecoverable for the victim but measures 4-6 bits/byte, under any usable threshold, for a 33-100%
+  size penalty most actors will happily pay. Detecting it needs a second signal (alphabet analysis,
+  chi-square, file-type change) - again, a new subsystem. Entropy detection recognizes ciphertext
+  that *looks* like ciphertext; honeypots are the only backstop for this whole category, which is
+  why the three honeypot fixes above matter more than they first appear.
+- **`LD_PRELOAD` and `ptrace` against an allowlisted binary.** Here `/proc/<pid>/exe` genuinely
+  points at the legitimate inode and the hash genuinely matches: the identity is authentic while the
+  behaviour is not. No hash-based anchor can distinguish this. Only allowlist tools your own scripts
+  launch, never ones an attacker can invoke from an environment they control.
+
 Caveats, honestly:
 
 - This is heuristic, behavior-based detection - not a cryptographic guarantee. A patient
@@ -328,6 +450,9 @@ Caveats, honestly:
   fixed, self-contained tool - the trust cache's 60-second window is checked against the trusted
   process's identity (see "Trust-cache identity gap" above), not against what code it's actually
   running at every instant.
+- Entropy-based detection sees ciphertext that looks like ciphertext. An attacker who encodes their
+  output (base64/hex) or writes through a shared memory mapping is invisible to it, as described
+  above - honeypots, not entropy, are what covers those cases.
 - Detection thresholds are defaults, not universal constants - tune `entropy_threshold`,
   `burst_file_count`, and `burst_window_secs` against your actual workload, ideally starting in
   `monitor` mode.
