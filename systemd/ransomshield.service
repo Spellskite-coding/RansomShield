@@ -5,9 +5,29 @@ After=local-fs.target
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/ransomshield --config /etc/ransomshield/config.json
-Restart=on-failure
-RestartSec=2
 NotifyAccess=main
+
+# Restart=always, not on-failure. The daemon exits 0 on SIGTERM, so with
+# on-failure a single `kill -TERM` switched the protection off permanently and
+# cleanly, with systemd treating that as a job well done. For a security
+# daemon the only intentional stop is `systemctl stop`, which Restart=always
+# still honours.
+Restart=always
+RestartSec=2
+
+# Deliberately NOT setting WatchdogSec=. Type=notify would give us the channel
+# for free, and a wedged monitor thread is genuinely invisible to systemd today
+# - but the daemon sends no WATCHDOG=1 pings, so enabling it would have systemd
+# kill and restart a perfectly healthy daemon on every interval. Pinging
+# honestly is also harder than it looks here: the monitor thread spends its
+# life blocked in a fanotify read() that returns only when events arrive, so on
+# a quiet host "no ping" and "wedged" are indistinguishable from the loop
+# itself. Left off until there is a liveness signal worth sending.
+
+# The plaintext-baseline set is bounded in code; this is the backstop so a
+# memory bug can never take the whole host down with it. A restart rebuilds the
+# baseline anyway.
+MemoryMax=512M
 
 # The daemon needs CAP_SYS_ADMIN for fanotify (filesystem-wide marks) and
 # CAP_KILL to neutralize offending processes in Enforce mode. Everything
@@ -16,6 +36,17 @@ AmbientCapabilities=CAP_SYS_ADMIN CAP_KILL
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_KILL
 NoNewPrivileges=true
 ProtectSystem=strict
+
+# Extra confinement for a CAP_SYS_ADMIN daemon. None of these cost anything
+# here: ransomshield never creates namespaces, loads modules, or needs
+# realtime scheduling or a non-native syscall ABI.
+RestrictNamespaces=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+LockPersonality=true
 # Only the config directory is writable from the base unit. ProtectSystem=strict
 # makes the rest of the filesystem read-only, so the daemon also needs write
 # access to wherever quarantine_dir/incident_reports_dir point and to every
