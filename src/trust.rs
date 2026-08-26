@@ -4,7 +4,7 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::TrustedExecutable;
 
@@ -21,6 +21,14 @@ use crate::config::TrustedExecutable;
 /// - or a malicious process merely naming itself the same thing - does not
 /// grant the bypass. Honeypot detection is never subject to this bypass:
 /// no legitimate trusted tool has a reason to touch a honeypot file.
+///
+/// What this anchor deliberately cannot cover: a process that *is* genuinely
+/// the trusted binary but has had foreign code injected into it, via
+/// `LD_PRELOAD` at exec time or `ptrace` afterwards. There `/proc/<pid>/exe`
+/// really does point at the legitimate inode and the hash really does match,
+/// so the identity is authentic while the behaviour is not. Only allowlist
+/// tools your own scripts launch, never ones an attacker can invoke from an
+/// environment they control - see the README caveats.
 pub struct TrustStore {
     trusted: Vec<TrustedExecutable>,
     /// Keyed by pid; value is (trusted?, when checked, that process's boot-relative
@@ -33,6 +41,46 @@ pub struct TrustStore {
 
 impl TrustStore {
     pub fn new(trusted: Vec<TrustedExecutable>) -> Self {
+        // Resolve every configured path once, up front.
+        //
+        // `/proc/<pid>/exe` reports the *resolved* path of the executed inode,
+        // but the operator writes whatever path they normally type. On any
+        // usr-merged distribution - Debian 12+, Ubuntu 20.04+, Fedora, RHEL 8+,
+        // Arch, i.e. essentially everything current - `/bin` and `/sbin` are
+        // symlinks into `/usr`, so a config saying `/bin/gpg` never matched the
+        // kernel's `/usr/bin/gpg` under a plain string comparison. The
+        // allowlist then silently did nothing, and in Enforce mode the
+        // operator's legitimate backup or encryption tool got killed with no
+        // hint as to why. Canonicalizing both sides fixes that.
+        //
+        // This does not weaken the anchor: the path is only a lookup key, and
+        // the SHA-256 of the running image is still what actually grants
+        // trust. A configured path that cannot be resolved is kept as-is and
+        // flagged, since a typo here also means "no trust, silently".
+        let trusted = trusted
+            .into_iter()
+            .map(|mut t| {
+                match t.path.canonicalize() {
+                    Ok(resolved) => {
+                        if resolved != t.path {
+                            info!(
+                                configured = %t.path.display(),
+                                resolved = %resolved.display(),
+                                "trusted executable path resolved to its real location"
+                            );
+                        }
+                        t.path = resolved;
+                    }
+                    Err(e) => warn!(
+                        path = %t.path.display(),
+                        error = %e,
+                        "configured trusted executable does not exist or cannot be resolved - \
+                         it will never be trusted; check the path"
+                    ),
+                }
+                t
+            })
+            .collect();
         Self { trusted, cache: HashMap::new(), cache_ttl: Duration::from_secs(60) }
     }
 
@@ -81,7 +129,7 @@ impl TrustStore {
     /// `comm` (the second field) is parsed defensively by searching for the
     /// last `)` rather than splitting on whitespace, since it can itself
     /// contain spaces or parentheses.
-    fn process_starttime(pid: i32) -> Option<u64> {
+    pub fn process_starttime(pid: i32) -> Option<u64> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after_comm = stat.rsplit_once(')')?.1;
         after_comm.split_whitespace().nth(19)?.parse().ok()
@@ -91,12 +139,27 @@ impl TrustStore {
         let Ok(exe_path) = fs::read_link(format!("/proc/{pid}/exe")) else {
             return false;
         };
+        let exe_path = exe_path.canonicalize().unwrap_or(exe_path);
 
         let Some(entry) = self.trusted.iter().find(|t| t.path == exe_path) else {
             return false;
         };
 
-        let Ok(mut f) = fs::File::open(&exe_path) else {
+        // Hash `/proc/<pid>/exe` *as a descriptor*, not the path it resolves
+        // to. Opening the resolved path re-opens whatever happens to sit
+        // there now, in *this* process's mount namespace - which is not
+        // necessarily the image the target is actually running. An attacker
+        // who unshares a mount namespace and bind-mounts their own binary
+        // over a trusted path executes their code while `readlink` still
+        // reports the trusted path; the daemon would then open and hash the
+        // real, untouched binary on the host, the hash would match, and the
+        // bypass would be granted. Unprivileged user namespaces are enabled
+        // by default on Debian and Ubuntu, so this needs no privilege.
+        //
+        // The magic descriptor always refers to the inode genuinely being
+        // executed, in any namespace, and it also removes the read_link/open
+        // race that opening by path had.
+        let Ok(mut f) = fs::File::open(format!("/proc/{pid}/exe")) else {
             return false;
         };
 
@@ -141,6 +204,38 @@ mod tests {
     #[test]
     fn process_starttime_is_none_for_a_pid_that_does_not_exist() {
         assert_eq!(TrustStore::process_starttime(999_999_999), None);
+    }
+
+    #[test]
+    fn a_trusted_path_that_goes_through_a_symlinked_directory_still_matches() {
+        // The usr-merge case: the operator configures /bin/tool, the kernel
+        // reports /usr/bin/tool. Before this was canonicalized, the allowlist
+        // silently matched nothing and the operator's legitimate tool was
+        // killed in Enforce mode.
+        let dir = std::env::temp_dir().join(format!("rs_trust_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        fs::create_dir_all(&real).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let target = real.join("tool");
+        fs::copy(&exe, &target).unwrap();
+
+        // A symlinked directory pointing at the real one, exactly like /bin -> usr/bin.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let store = TrustStore::new(vec![TrustedExecutable {
+            path: link.join("tool"),
+            sha256: String::new(),
+        }]);
+
+        assert_eq!(
+            store.trusted[0].path,
+            target.canonicalize().unwrap(),
+            "a configured path through a symlinked directory must resolve to the real one"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
