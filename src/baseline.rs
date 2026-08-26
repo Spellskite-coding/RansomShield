@@ -71,7 +71,29 @@ pub fn seed(detector: &mut Detector, root: &Path, sample_bytes: usize, entropy_t
             }
         };
 
+        // One plaintext file already proves this directory holds ordinary
+        // content; scoring its remaining files adds nothing and burns the
+        // scan budget. That budget is a real security boundary: with
+        // `require_directory_baseline` on (the default), a directory the
+        // scan never reached contributes nothing to the burst heuristic, so
+        // detection there is simply off. Scoring every file meant an
+        // attacker could flood one directory with 50_000 junk files and
+        // starve the walk before it ever reached the real data - a cheap,
+        // pre-attack disarm that survives the next daemon restart. Stopping
+        // at the first hit turns the cap into "50_000 directories" instead
+        // of "50_000 files", and makes the whole scan far shorter, which
+        // also shrinks the startup window during which no event is handled.
+        let mut dir_baselined = false;
+
         for entry in entries.flatten() {
+            if dir_baselined {
+                // Still need to keep descending into subdirectories.
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+                continue;
+            }
             if scanned >= MAX_FILES_SCANNED {
                 warn!(
                     limit = MAX_FILES_SCANNED,
@@ -101,6 +123,7 @@ pub fn seed(detector: &mut Detector, root: &Path, sample_bytes: usize, entropy_t
 
             if min_sampled_entropy(&mut f, sample_bytes).is_some_and(|e| e < entropy_threshold) {
                 detector.note_plaintext_activity(&path);
+                dir_baselined = true;
             }
         }
     }
