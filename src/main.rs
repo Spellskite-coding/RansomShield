@@ -15,7 +15,11 @@ use std::path::PathBuf;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
-#[command(name = "ransomshield", about = "Behavior-based ransomware detection daemon")]
+#[command(
+    name = "ransomshield",
+    version,
+    about = "Behavior-based ransomware detection daemon"
+)]
 struct Args {
     /// Path to the JSON config file.
     #[arg(short, long, default_value = "/etc/ransomshield/config.json")]
@@ -44,7 +48,7 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load(&args.config)?;
     info!(?cfg.mode, watch_dirs = ?cfg.watch_dirs, "loaded config");
 
-    let honeypots = honeypot::provision(&cfg.honeypots)?;
+    let honeypots = honeypot::Honeypots::provision(&cfg.honeypots)?;
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let worker_cfg = cfg.clone();
