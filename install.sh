@@ -140,7 +140,7 @@ log_ok "installed binary to $BIN_DEST"
 # ---------------------------------------------------------------------------
 # Directories
 # ---------------------------------------------------------------------------
-install -d -m 0755 -o root -g root "$CONFIG_DIR"
+install -d -m 0750 -o root -g root "$CONFIG_DIR"
 install -d -m 0700 -o root -g root "$QUARANTINE_DIR"
 install -d -m 0700 -o root -g root "$INCIDENTS_DIR"
 log_ok "created $CONFIG_DIR, $QUARANTINE_DIR, $INCIDENTS_DIR"
@@ -171,7 +171,16 @@ json_escape() {
 EFFECTIVE_WATCH_DIRS=("${WATCH_DIRS[@]}")
 
 if [ -f "$CONFIG_FILE" ]; then
-    log_warn "$CONFIG_FILE already exists, leaving it untouched (watch_dirs/mode arguments to this run are ignored)"
+    log_warn "$CONFIG_FILE already exists, leaving its contents untouched (watch_dirs/mode arguments to this run are ignored)"
+    # Contents are preserved, but permissions are corrected: earlier versions
+    # installed this world-readable, and the daemon now refuses to start on a
+    # group/world-writable config.
+    current_mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo unknown)"
+    if [ "$current_mode" != "600" ]; then
+        chmod 0600 "$CONFIG_FILE"
+        chown root:root "$CONFIG_FILE"
+        log_warn "tightened $CONFIG_FILE from mode $current_mode to 0600 (it lists your honeypot locations and thresholds)"
+    fi
     # The ReadWritePaths drop-in below must grant access to what's actually
     # configured, not to this run's (ignored) arguments - otherwise a
     # reinstall after watch_dirs changed by hand would grant access to the
@@ -210,7 +219,12 @@ else
   "mode": "$MODE"
 }
 EOF
-    chmod 0644 "$CONFIG_FILE"
+    # 0600, not 0644. This file lists exactly where the honeypots are, which
+    # directories are watched, the detection thresholds, and the trusted-binary
+    # allowlist - i.e. a complete map of what an attacker needs to avoid. Only
+    # root needs to read it.
+    chmod 0600 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE"
     log_ok "wrote $CONFIG_FILE (mode=$MODE, watch_dirs=${WATCH_DIRS[*]})"
     if [ "$MODE" = "enforce" ]; then
         log_warn "starting directly in enforce mode - make sure you've already validated this workload against false positives (see README)"
