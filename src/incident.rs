@@ -60,7 +60,7 @@ impl IncidentReporter {
              Mode: {mode:?}\n\
              Action taken: {}\n\
              Suspect PID: {pid}\n\
-             Reason: {reason}\n\
+             Reason: {}\n\
              \n\
              Affected files ({}):\n{}\n\
              \n\
@@ -68,8 +68,9 @@ impl IncidentReporter {
             if action_taken {
                 "yes - process killed (SIGSTOP then SIGKILL), files below moved to quarantine"
             } else {
-                "no - monitor mode, observation only"
+                "no - monitor mode or the process could not be neutralized, see logs"
             },
+            sanitize(reason),
             affected_files.len(),
             format_list(affected_files),
             quarantined_files.len(),
@@ -92,7 +93,7 @@ impl IncidentReporter {
     fn notify(&self, cmd: &str, pid: i32, reason: &str, report_path: &Path, action_taken: bool) {
         let result = std::process::Command::new(cmd)
             .env("RANSOMSHIELD_PID", pid.to_string())
-            .env("RANSOMSHIELD_REASON", reason)
+            .env("RANSOMSHIELD_REASON", sanitize(reason))
             .env("RANSOMSHIELD_REPORT_PATH", report_path)
             .env("RANSOMSHIELD_ACTION_TAKEN", action_taken.to_string())
             .stdin(Stdio::null())
@@ -124,7 +125,24 @@ fn format_list(paths: &[PathBuf]) -> String {
     }
     paths
         .iter()
-        .map(|p| format!("  - {}", p.display()))
+        .map(|p| format!("  - {}", sanitize(&p.display().to_string())))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Strip control characters out of anything attacker-controlled before it is
+/// written into a report or handed to a notify hook.
+///
+/// Filenames may contain newlines, quotes, escape sequences - anything but
+/// `/` and NUL. Interpolated raw into this plain-text report, a file named
+/// e.g. `invoice.txt\n\nAffected files (0):\n  (none)\n` injects
+/// structurally valid lines and forges the record, which matters when the
+/// report is the artifact an incident responder reads. The same strings go
+/// into `RANSOMSHIELD_*` for an operator hook that runs as root, where an
+/// unquoted expansion or an `eval` turns a filename into command execution.
+/// (The JSONL quarantine manifest was already safe: serde_json escapes.)
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
