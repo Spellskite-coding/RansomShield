@@ -116,9 +116,91 @@ impl Config {
     pub fn load(path: &std::path::Path) -> Result<Config> {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
+        // A config file that any local user can rewrite is the whole security
+        // boundary of this daemon: it decides what is watched, where the
+        // honeypots are, and which executables are exempt. Refuse to run on a
+        // group/world-writable one rather than silently trusting it.
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            anyhow::ensure!(
+                mode & 0o022 == 0,
+                "config file {} is group/world-writable (mode {:o}); refusing to start - \
+                 run: chmod 0600 {}",
+                path.display(),
+                mode & 0o7777,
+                path.display()
+            );
+        }
         let cfg: Config = serde_json::from_str(&data)
             .with_context(|| format!("parsing config file {}", path.display()))?;
-        anyhow::ensure!(!cfg.watch_dirs.is_empty(), "watch_dirs must not be empty");
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Reject configurations that silently disable detection or turn the
+    /// daemon into a hair-trigger. Every one of these values is accepted by
+    /// serde as a perfectly well-formed number, but lands the daemon in a
+    /// state where it either never fires (`sample_bytes: 0` makes every
+    /// entropy probe zero-length, so no event is ever scored; an
+    /// `entropy_threshold` above 8.0 can never be reached) or fires on
+    /// everything (`burst_file_count: 0` makes the `>=` comparison trivially
+    /// true, so the first high-entropy write from any process is a
+    /// detection). A misconfigured security daemon must be loud, not quiet.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.watch_dirs.is_empty(), "watch_dirs must not be empty");
+        anyhow::ensure!(
+            self.entropy_threshold > 0.0 && self.entropy_threshold < 8.0,
+            "entropy_threshold must be between 0 and 8 bits/byte (got {}); 8.0 is the maximum \
+             a byte can carry, so anything at or above it can never be reached",
+            self.entropy_threshold
+        );
+        anyhow::ensure!(
+            self.burst_file_count >= 2,
+            "burst_file_count must be at least 2 (got {}); 0 or 1 would make a single \
+             high-entropy write from any process a detection",
+            self.burst_file_count
+        );
+        anyhow::ensure!(self.burst_window_secs >= 1, "burst_window_secs must be at least 1");
+        anyhow::ensure!(
+            self.sample_bytes >= 1024,
+            "sample_bytes must be at least 1024 (got {}); a smaller budget makes entropy \
+             sampling meaningless, and 0 disables detection entirely",
+            self.sample_bytes
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<Config> {
+        let cfg: Config = serde_json::from_str(json)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn a_sane_config_is_accepted() {
+        assert!(parse(r#"{"watch_dirs":["/data"],"mode":"enforce"}"#).is_ok());
+    }
+
+    #[test]
+    fn values_that_silently_disable_detection_are_rejected() {
+        // sample_bytes = 0 makes every entropy probe zero-length: the daemon
+        // would start, log "ready", and never score a single event again.
+        assert!(parse(r#"{"watch_dirs":["/d"],"mode":"enforce","sample_bytes":0}"#).is_err());
+        // An unreachable threshold has the same effect by another route.
+        assert!(parse(r#"{"watch_dirs":["/d"],"mode":"enforce","entropy_threshold":99.0}"#).is_err());
+    }
+
+    #[test]
+    fn values_that_make_the_daemon_a_hair_trigger_are_rejected() {
+        // burst_file_count = 0 makes `files.len() >= 0` trivially true, so the
+        // first high-entropy write by any process gets it killed.
+        assert!(parse(r#"{"watch_dirs":["/d"],"mode":"enforce","burst_file_count":0}"#).is_err());
+        assert!(parse(r#"{"watch_dirs":["/d"],"mode":"enforce","burst_file_count":1}"#).is_err());
     }
 }
