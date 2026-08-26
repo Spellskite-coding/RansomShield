@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -10,7 +9,7 @@ use crate::baseline;
 use crate::config::Config;
 use crate::detector::{Detector, Verdict};
 use crate::entropy::shannon_entropy;
-use crate::honeypot;
+use crate::honeypot::Honeypots;
 use crate::incident::IncidentReporter;
 use crate::quarantine::Quarantine;
 use crate::response;
@@ -20,24 +19,66 @@ const WATCHED_EVENTS: MaskFlags = MaskFlags::from_bits_truncate(
     MaskFlags::FAN_CLOSE_WRITE.bits() | MaskFlags::FAN_MODIFY.bits(),
 );
 
-/// Reads up to `budget` bytes of the file behind `fd`, sampled from up to
-/// three points (start, middle, end) instead of only its head, and returns
-/// the *highest* Shannon entropy measured across those samples - `None` if
-/// the file is empty.
+/// How many points in a file to sample for entropy. Each probe gets
+/// `sample_bytes / PROBE_COUNT` bytes, so the total read per event is
+/// unchanged from a single-probe scheme.
+const PROBE_COUNT: usize = 5;
+
+/// A tiny xorshift64 PRNG, seeded from the clock. Used only to pick entropy
+/// sampling offsets - never for anything security-critical in the
+/// cryptographic sense - so a non-CSPRNG with no external dependency is the
+/// right tool.
+struct Rng(u64);
+
+impl Rng {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x243F_6A88_85A3_08D3);
+        // Never seed a xorshift with zero: it would stay zero forever.
+        Self(nanos | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Uniform-ish value in `0..bound`. Modulo bias is irrelevant here.
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 { 0 } else { self.next() % bound }
+    }
+}
+
+/// Reads up to `budget` bytes of the file behind `fd`, sampled from several
+/// *randomly chosen* offsets, and returns the highest Shannon entropy
+/// measured across those samples - `None` if the file is empty.
 ///
-/// Sampling only a file's first few KB (as this used to do) is blind to
-/// intermittent/partial encryption, a technique some real ransomware uses
-/// specifically to evade entropy-based detectors: leave the first N bytes
-/// as-is and only encrypt from some offset onward, so a head-only sample
-/// keeps reading as ordinary plaintext while the rest of the file is
-/// destroyed. Scoring each sampled chunk on its own and taking the max
-/// (rather than concatenating all the sampled bytes into one buffer and
-/// scoring that) matters: blending a plaintext chunk together with a
-/// high-entropy one computes the entropy of the *mixture*, which can land
-/// comfortably back under the threshold even though a pure high-entropy
-/// chunk was read - silently defeating the point of sampling more than one
-/// offset in the first place.
-fn max_sampled_entropy(fd: std::os::fd::BorrowedFd, budget: usize) -> Option<f64> {
+/// Sampling only a file's first few KB is blind to intermittent/partial
+/// encryption, a technique real ransomware uses specifically to evade
+/// entropy-based detectors: leave the head as-is and only encrypt from some
+/// offset onward, so a head-only sample keeps reading as ordinary plaintext
+/// while the rest of the file is destroyed.
+///
+/// Sampling at *fixed* points (start, middle, end - what this used to do) only
+/// moves the problem. Those offsets are derived from public constants and the
+/// file's own size, so an attacker can compute them exactly and leave
+/// plaintext in precisely those windows. That was confirmed in testing: a
+/// 1 MiB file with only the three 2,730-byte probe windows left intact - 99.2%
+/// of it high-entropy - measured 4.397 bits/byte and sailed under a 7.5
+/// threshold. Choosing offsets at random per event removes the target: an
+/// attacker cannot align plaintext with positions they cannot predict, and
+/// each additional probe multiplies the odds against them.
+///
+/// Scoring each chunk on its own and taking the max (rather than
+/// concatenating everything into one buffer and scoring that) matters:
+/// blending a plaintext chunk with a high-entropy one computes the entropy of
+/// the *mixture*, which can land comfortably back under the threshold even
+/// though a pure high-entropy chunk was read.
+fn max_sampled_entropy(fd: std::os::fd::BorrowedFd, budget: usize, rng: &mut Rng) -> Option<f64> {
     let size = nix::unistd::lseek(&fd, 0, Whence::SeekEnd).unwrap_or(0).max(0) as u64;
 
     let probe = |offset: u64, len: usize| -> Option<f64> {
@@ -50,18 +91,24 @@ fn max_sampled_entropy(fd: std::os::fd::BorrowedFd, budget: usize) -> Option<f64
         (!chunk.is_empty()).then(|| shannon_entropy(&chunk))
     };
 
-    let samples: Vec<f64> = if size as usize <= budget {
-        probe(0, budget).into_iter().collect()
-    } else {
-        let third = budget / 3;
-        let last = budget - 2 * third;
-        [probe(0, third), probe(size / 2, third), probe(size.saturating_sub(last as u64), last)]
-            .into_iter()
-            .flatten()
-            .collect()
-    };
+    // Small enough to read whole: no sampling decision to make, and no way to
+    // hide anything between probes.
+    if size as usize <= budget {
+        return probe(0, budget);
+    }
 
-    samples.into_iter().reduce(f64::max)
+    let chunk = (budget / PROBE_COUNT).max(1);
+    let span = size.saturating_sub(chunk as u64).saturating_add(1);
+
+    (0..PROBE_COUNT)
+        .filter_map(|_| probe(rng.below(span), chunk))
+        .reduce(f64::max)
+}
+
+/// The `(st_dev, st_ino)` of the file an event refers to.
+fn inode_of(fd: std::os::fd::BorrowedFd) -> Option<(u64, u64)> {
+    let st = nix::sys::stat::fstat(fd).ok()?;
+    Some((st.st_dev as u64, st.st_ino as u64))
 }
 
 /// One-time setup: initialize the fanotify group, mark the watched
@@ -70,7 +117,12 @@ fn max_sampled_entropy(fd: std::os::fd::BorrowedFd, budget: usize) -> Option<f64
 /// daemon "ready", whether monitoring actually came up - starting to
 /// listen for connections/events successfully is the bar `sd_notify`
 /// READY should be gated on, not just "the process is alive".
-fn init(cfg: &Config) -> Result<(Fanotify, Detector, Quarantine, IncidentReporter)> {
+///
+/// Also returns the canonicalized watch roots, which every event path is
+/// checked against - see the scope filter in `run`.
+fn init(
+    cfg: &Config,
+) -> Result<(Fanotify, Detector, Quarantine, IncidentReporter, Vec<PathBuf>)> {
     // FAN_UNLIMITED_QUEUE removes the default event queue cap (historically
     // 16384). A fast, aggressive ransomware run is precisely the scenario
     // that generates a huge burst of events in a short time - the one case
@@ -83,13 +135,19 @@ fn init(cfg: &Config) -> Result<(Fanotify, Detector, Quarantine, IncidentReporte
     )
     .context("fanotify_init failed (need CAP_SYS_ADMIN, i.e. run as root)")?;
 
+    let mut roots = Vec::new();
+
     for dir in &cfg.watch_dirs {
         let handle = std::fs::File::open(dir)
             .with_context(|| format!("opening watch dir {}", dir.display()))?;
-        // FAN_MARK_FILESYSTEM watches the whole mount the path belongs to.
-        // For this to stay scoped to what you actually intend, `dir` should
-        // be its own mount point (a dedicated volume/bind mount), not a
-        // subdirectory of a much larger filesystem such as `/`.
+        // FAN_MARK_FILESYSTEM watches the whole mount the path belongs to,
+        // not just this directory. That is deliberate (it is the only way to
+        // catch writes through any path to the same files), but it means the
+        // kernel hands us events from everywhere on that filesystem - so the
+        // daemon filters them back down to `watch_dirs` itself, in `run`.
+        // Without that filter a default install (watch_dirs = ["/home"], and
+        // /home is rarely its own mount) would let the daemon kill processes
+        // and relocate files anywhere on /.
         group
             .mark(
                 MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_FILESYSTEM,
@@ -98,18 +156,21 @@ fn init(cfg: &Config) -> Result<(Fanotify, Detector, Quarantine, IncidentReporte
                 None::<&std::path::Path>,
             )
             .with_context(|| format!("fanotify_mark failed for {}", dir.display()))?;
-        info!(dir = %dir.display(), "watching");
+
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        info!(dir = %dir.display(), scope = %canonical.display(), "watching");
+        roots.push(canonical);
     }
 
     let mut detector = Detector::new(cfg);
-    let quarantine = Quarantine::new(&cfg.quarantine_dir)?;
+    let quarantine = Quarantine::new(&cfg.quarantine_dir, roots.clone())?;
     let incidents = IncidentReporter::new(&cfg.incident_reports_dir, cfg.notify_command.clone())?;
 
     for dir in &cfg.watch_dirs {
         baseline::seed(&mut detector, dir, cfg.sample_bytes, cfg.entropy_threshold);
     }
 
-    Ok((group, detector, quarantine, incidents))
+    Ok((group, detector, quarantine, incidents, roots))
 }
 
 /// Blocking fanotify read/dispatch loop. Meant to run on a dedicated
@@ -122,11 +183,11 @@ fn init(cfg: &Config) -> Result<(Fanotify, Detector, Quarantine, IncidentReporte
 /// having actually come up rather than merely having started a thread.
 pub fn run(
     cfg: Config,
-    honeypots: HashSet<PathBuf>,
+    mut honeypots: Honeypots,
     ready_tx: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let sample_bytes = cfg.sample_bytes;
-    let (group, mut detector, quarantine, incidents) = match init(&cfg) {
+    let (group, mut detector, quarantine, incidents, roots) = match init(&cfg) {
         Ok(v) => {
             let _ = ready_tx.send(Ok(()));
             v
@@ -137,8 +198,16 @@ pub fn run(
         }
     };
 
+    // A honeypot outside every watch root is provisioned fine and then never
+    // fires: it looks like protection while providing none. Say so at startup
+    // rather than letting an operator discover it during an incident.
+    if !honeypots.is_empty() && !honeypots.all_within(&roots) {
+        warn!("at least one configured honeypot is not under any watch_dir - it will never trigger");
+    }
+
     let own_pid = std::process::id() as i32;
     let mut trust = TrustStore::new(cfg.trusted_executables.clone());
+    let mut rng = Rng::new();
     info!(mode = ?cfg.mode, trusted_executables = cfg.trusted_executables.len(), "ransomshield monitor loop started");
 
     // A single spurious read_events() failure is worth retrying, but
@@ -181,25 +250,65 @@ pub fn run(
                 continue;
             };
 
-            let path = std::fs::read_link(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd)))
-                .unwrap_or_else(|_| PathBuf::from("<unknown>"));
+            // Honeypot identity is the inode, not the path. A path is a string
+            // that can be detached from its inode - a hard link, a rename, or
+            // an unlink-while-open (which makes /proc/self/fd read
+            // "<path> (deleted)") all let an attacker write to the very same
+            // canary while matching no configured path.
+            let ident = inode_of(fd);
+            let honeypot_hit = ident.and_then(|(dev, ino)| {
+                honeypots.lookup(dev, ino).map(|p| (dev, ino, p.to_path_buf()))
+            });
 
-            if honeypot::is_honeypot(&honeypots, &path) {
-                let mut affected = detector.files_for_pid(pid);
-                affected.push(path.clone());
-                response::handle_detection(
+            let path = match std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&fd)
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Previously this substituted the literal path "<unknown>",
+                    // which collapsed every unresolvable write by a pid into a
+                    // single entry in the distinct-file burst counter, so they
+                    // could never add up to a detection.
+                    debug!(pid, error = %e, "could not resolve event path, skipping event");
+                    continue;
+                }
+            };
+
+            if let Some((dev, ino, canary_path)) = honeypot_hit {
+                // Deliberately does NOT include the canary itself in the files
+                // to quarantine. Quarantine moves a file off the live
+                // filesystem, so including it made the daemon destroy its own
+                // trap on the first hit - and nothing re-provisions honeypots
+                // outside startup. One throwaway `touch` per honeypot was
+                // enough to disarm them all before the real payload ran.
+                let affected = detector.files_for_pid(pid);
+                let neutralized = response::handle_detection(
                     cfg.mode,
                     pid,
-                    &format!("honeypot touched: {}", path.display()),
+                    detector.starttime_for_pid(pid),
+                    &format!("honeypot touched: {}", canary_path.display()),
                     &affected,
                     &quarantine,
                     &incidents,
                 );
-                detector.forget(pid);
+                honeypots.rearm(dev, ino);
+                if neutralized {
+                    detector.forget(pid);
+                }
                 continue;
             }
 
-            let Some(entropy) = max_sampled_entropy(fd, sample_bytes) else {
+            // Scope filter. FAN_MARK_FILESYSTEM delivers events for the entire
+            // mount, so without this the daemon acts - lethally, and by
+            // relocating files - far outside the directories the operator
+            // actually declared. This also drops the bulk of the event volume
+            // on a busy host before any I/O is done for it.
+            if !roots.iter().any(|r| path.starts_with(r)) {
+                continue;
+            }
+
+            let Some(entropy) = max_sampled_entropy(fd, sample_bytes, &mut rng) else {
                 continue;
             };
             debug!(pid, path = %path.display(), entropy, "file write observed");
@@ -210,9 +319,10 @@ pub fn run(
                 debug!(pid, path = %path.display(), "high-entropy write from a trusted executable, not counting toward burst");
             } else if let Verdict::Burst { count } = detector.observe_high_entropy_write(pid, &path) {
                 let affected = detector.files_for_pid(pid);
-                response::handle_detection(
+                let neutralized = response::handle_detection(
                     cfg.mode,
                     pid,
+                    detector.starttime_for_pid(pid),
                     &format!(
                         "{count} high-entropy file rewrites within {}s (last: {})",
                         cfg.burst_window_secs,
@@ -222,7 +332,14 @@ pub fn run(
                     &quarantine,
                     &incidents,
                 );
-                detector.forget(pid);
+                // Only clear the bookkeeping once the process is confirmed
+                // gone. Clearing it after a failed kill would hand a still-
+                // running ransomware process a fresh counter, forcing it to
+                // re-accumulate burst_file_count files before tripping again -
+                // forever, while it keeps encrypting.
+                if neutralized {
+                    detector.forget(pid);
+                }
             }
         }
     }
@@ -266,7 +383,7 @@ mod tests {
             f.write_all(&pseudo_random_bytes(64 * 1024)).unwrap();
         }
         let f = std::fs::File::open(&path).unwrap();
-        let max_e = max_sampled_entropy(f.as_fd(), 8192);
+        let max_e = max_sampled_entropy(f.as_fd(), 8192, &mut Rng::new());
         let _ = std::fs::remove_file(&path);
 
         let max_e = max_e.expect("file is not empty");
@@ -278,7 +395,7 @@ mod tests {
         let path = temp_path("live_empty.bin");
         std::fs::File::create(&path).unwrap();
         let f = std::fs::File::open(&path).unwrap();
-        let result = max_sampled_entropy(f.as_fd(), 8192);
+        let result = max_sampled_entropy(f.as_fd(), 8192, &mut Rng::new());
         let _ = std::fs::remove_file(&path);
         assert!(result.is_none());
     }
@@ -295,7 +412,7 @@ mod tests {
             f.write_all(b"just an ordinary short text file\n").unwrap();
         }
         let f = std::fs::File::open(&path).unwrap();
-        let e = max_sampled_entropy(f.as_fd(), 8192);
+        let e = max_sampled_entropy(f.as_fd(), 8192, &mut Rng::new());
         let _ = std::fs::remove_file(&path);
 
         let e = e.expect("file is not empty");
