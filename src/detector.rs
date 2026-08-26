@@ -3,6 +3,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::trust::TrustStore;
+
+/// Upper bound on the plaintext-baseline set. Every low-entropy write adds its
+/// parent directory here and nothing ever removed one, so on a busy host - or
+/// under an attacker deliberately creating millions of directories each
+/// holding one small plaintext file - this grew without limit until the daemon
+/// was OOM-killed, i.e. until the protection itself went down. That is the
+/// same leak class already fixed for `recent_writes`; this set was missed.
+///
+/// Saturating degrades detection toward *more permissive*, never toward more
+/// destructive, which is the right way for this to fail.
+const MAX_BASELINED_DIRS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -29,7 +41,13 @@ pub struct Detector {
     burst_window: Duration,
     require_directory_baseline: bool,
     recent_writes: HashMap<i32, HashMap<PathBuf, Instant>>,
+    /// Per-pid process start time, captured when we first see that pid write.
+    /// This is what lets the response verify, right before it kills, that the
+    /// pid still refers to the process that actually did the writing - see
+    /// `starttime_for_pid`.
+    pid_identity: HashMap<i32, u64>,
     directories_with_plaintext_history: HashSet<PathBuf>,
+    baseline_saturated: bool,
 }
 
 impl Detector {
@@ -39,16 +57,33 @@ impl Detector {
             burst_window: Duration::from_secs(cfg.burst_window_secs),
             require_directory_baseline: cfg.require_directory_baseline,
             recent_writes: HashMap::new(),
+            pid_identity: HashMap::new(),
             directories_with_plaintext_history: HashSet::new(),
+            baseline_saturated: false,
         }
     }
 
     /// Record that `path` was written with ordinary (low-entropy) content,
     /// establishing its directory as one that holds real plaintext data.
     pub fn note_plaintext_activity(&mut self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            self.directories_with_plaintext_history.insert(dir.to_path_buf());
+        let Some(dir) = path.parent() else { return };
+        if self.directories_with_plaintext_history.contains(dir) {
+            return;
         }
+        if self.directories_with_plaintext_history.len() >= MAX_BASELINED_DIRS {
+            if !self.baseline_saturated {
+                self.baseline_saturated = true;
+                tracing::warn!(
+                    limit = MAX_BASELINED_DIRS,
+                    "plaintext-baseline set is full; not recording further directories \
+                     (detection becomes more permissive in unseen directories, never more \
+                     destructive). If this is not an attack flooding the filesystem with \
+                     directories, narrow watch_dirs."
+                );
+            }
+            return;
+        }
+        self.directories_with_plaintext_history.insert(dir.to_path_buf());
     }
 
     /// Whether `path`'s directory, or any ancestor of it, has previously
@@ -78,6 +113,15 @@ impl Detector {
             return Verdict::Clean;
         }
 
+        // Bind this pid to the process currently wearing it, the first time we
+        // see it write. The response re-checks this immediately before
+        // SIGSTOP/SIGKILL so a recycled pid never gets someone else killed.
+        if let std::collections::hash_map::Entry::Vacant(e) = self.pid_identity.entry(pid) {
+            if let Some(start) = TrustStore::process_starttime(pid) {
+                e.insert(start);
+            }
+        }
+
         let now = Instant::now();
         let window = self.burst_window;
 
@@ -94,6 +138,7 @@ impl Detector {
             files.retain(|_, &mut seen| now.duration_since(seen) <= window);
             !files.is_empty()
         });
+        self.pid_identity.retain(|pid, _| self.recent_writes.contains_key(pid));
 
         let files = self.recent_writes.entry(pid).or_default();
         files.insert(path.to_path_buf(), now);
@@ -113,10 +158,22 @@ impl Detector {
             .unwrap_or_default()
     }
 
-    /// Drop bookkeeping for a PID once we've responded to it (killed or
-    /// otherwise dealt with), so a reused PID starts with a clean slate.
+    /// The process start time recorded when `pid` was first seen writing, so
+    /// the response can confirm it is still the same process before acting.
+    pub fn starttime_for_pid(&self, pid: i32) -> Option<u64> {
+        self.pid_identity.get(&pid).copied()
+    }
+
+    /// Drop bookkeeping for a PID once we've *successfully* responded to it,
+    /// so a reused PID starts with a clean slate.
+    ///
+    /// Only call this when the process is confirmed neutralized. Clearing it
+    /// after a failed kill hands a still-running ransomware process a fresh
+    /// counter, so it has to re-accumulate `burst_file_count` files before
+    /// tripping again - forever, while it keeps encrypting.
     pub fn forget(&mut self, pid: i32) {
         self.recent_writes.remove(&pid);
+        self.pid_identity.remove(&pid);
     }
 }
 
